@@ -38,27 +38,30 @@ export default function App() {
 
     setIsLoading(true);
     setIsPlaying(true);
+    setCurrentWordIndex(-1);
     
+    // Stop any previous playback if necessary (not fully implemented here but using abortControllerRef)
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+    abortControllerRef.current = new AbortController();
+    const signal = abortControllerRef.current.signal;
+
     try {
-      // Only split if text is really long (over 4000 characters) to avoid unnecessary fragmentation
-      let chunks: string[] = [];
-      if (textToSpeak.length <= 4000) {
-        chunks = [textToSpeak];
-      } else {
-        // Split by sentences but group them into larger chunks of ~4000 chars
-        const sentences = textToSpeak.match(/[^.!?]+[.!?]+|.{1,1000}/g) || [textToSpeak];
-        let currentChunk = "";
-        for (const sentence of sentences) {
-          if ((currentChunk + sentence).length < 4000) {
-            currentChunk += sentence;
-          } else {
-            if (currentChunk) chunks.push(currentChunk.trim());
-            currentChunk = sentence;
-          }
+      // Split text into intelligent chunks
+      const chunks: string[] = [];
+      const sentences = textToSpeak.match(/[^.!?]+[.!?]+|.{1,1000}/g) || [textToSpeak];
+      let currentGroup = "";
+      for (const sentence of sentences) {
+        if ((currentGroup + sentence).length < 2500) { 
+          currentGroup += sentence;
+        } else {
+          if (currentGroup) chunks.push(currentGroup.trim());
+          currentGroup = sentence;
         }
-        if (currentChunk) chunks.push(currentChunk.trim());
       }
-      
+      if (currentGroup) chunks.push(currentGroup.trim());
+
       // Add to history
       if (textToSpeak === text) {
         const newItem: HistoryItem = {
@@ -70,78 +73,97 @@ export default function App() {
         setHistory(prev => [newItem, ...prev].slice(0, 10));
       }
 
-      for (let i = 0; i < chunks.length; i++) {
-        const chunk = chunks[i].trim();
-        if (!chunk) continue;
-
-        setCurrentChunk(chunk);
-
-        if (chunks.length > 1) {
-          toast.info(`Przetwarzanie części ${i + 1} z ${chunks.length}...`, { duration: 1500 });
-        }
-
-        const response = await ai.models.generateContent({
-          model: TTS_MODEL,
-          contents: [{ 
-            parts: [{ 
-              text: chunk // No need for "Przeczytaj..." prefix for the specialized TTS model
-            }] 
-          }],
-          config: {
-            responseModalities: ['AUDIO'],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: { voiceName: selectedVoice },
+      // Helper to fetch audio for a specific chunk
+      const fetchAudio = async (chunk: string): Promise<string | null> => {
+        try {
+          const response = await ai.models.generateContent({
+            model: TTS_MODEL,
+            contents: [{ parts: [{ text: chunk }] }],
+            config: {
+              responseModalities: [Modality.AUDIO],
+              speechConfig: {
+                voiceConfig: {
+                  prebuiltVoiceConfig: { voiceName: selectedVoice },
+                },
               },
             },
-          },
-        });
+          });
+          return response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data || null;
+        } catch (err) {
+          console.error("Fetch audio error:", err);
+          return null;
+        }
+      };
 
-        const base64Audio = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+      // Prefetch state
+      const prefetchQueue: Promise<string | null>[] = [];
+      const MAX_PREFETCH = 2;
+
+      // Word tracking global offset
+      let globalWordOffset = 0;
+
+      for (let i = 0; i < chunks.length; i++) {
+        if (signal.aborted) break;
+
+        const chunk = chunks[i];
         
-        if (base64Audio) {
-          await playPCMAudio(base64Audio, 24000, (progress) => {
-            if (isTrackingEnabled) {
-              const words = chunk.split(/\s+/);
-              
-              // Calculate weights for each word to simulate pauses at punctuation
-              // This helps sync the highlighting when the TTS model pauses
-              const weightedWords = words.map(word => {
-                let weight = word.length;
-                // Add "phantom" length for punctuation to simulate pauses
-                if (word.endsWith('.') || word.endsWith('!') || word.endsWith('?')) weight += 12;
-                else if (word.endsWith(',')) weight += 6;
-                else if (word.endsWith(';') || word.endsWith(':')) weight += 4;
-                return weight;
-              });
-              
-              const totalWeight = weightedWords.reduce((a, b) => a + b, 0);
-              
-              // Find the word corresponding to the current progress
-              let currentWeightSum = 0;
-              for (let j = 0; j < words.length; j++) {
-                currentWeightSum += weightedWords[j];
-                if (currentWeightSum / totalWeight >= progress) {
-                  setCurrentWordIndex(j);
-                  break;
-                }
+        while (prefetchQueue.length < MAX_PREFETCH && (i + prefetchQueue.length) < chunks.length) {
+          const nextIdx = i + prefetchQueue.length;
+          prefetchQueue.push(fetchAudio(chunks[nextIdx]));
+        }
+
+        const audioPromise = prefetchQueue.shift();
+        const base64Audio = await audioPromise;
+
+        if (signal.aborted) break;
+        if (!base64Audio) continue;
+
+        setCurrentChunk(chunk);
+        setIsLoading(false);
+
+        const chunkOffset = globalWordOffset;
+        const chunkWords = chunk.split(/\s+/).filter(w => w.length > 0);
+
+        await playPCMAudio(base64Audio, 24000, (progress) => {
+          if (isTrackingEnabled && !signal.aborted) {
+            const weightedWords = chunkWords.map(word => {
+              let weight = word.length;
+              if (word.endsWith('.') || word.endsWith('!') || word.endsWith('?')) weight += 15;
+              else if (word.endsWith(',')) weight += 8;
+              return weight;
+            });
+            
+            const totalWeight = weightedWords.reduce((a, b) => a + b, 0);
+            let currentWeightSum = 0;
+            for (let j = 0; j < chunkWords.length; j++) {
+              currentWeightSum += weightedWords[j];
+              if (currentWeightSum / totalWeight >= progress) {
+                setCurrentWordIndex(chunkOffset + j);
+                break;
               }
             }
-          });
-        } else {
-          console.error("No audio data in response candidate:", response.candidates?.[0]);
-          throw new Error("Nie otrzymano danych audio dla fragmentu " + (i + 1));
-        }
+          }
+        }, signal);
+
+        globalWordOffset += chunkWords.length;
       }
     } catch (error: any) {
-      console.error("TTS Error Details:", error);
-      const errorMessage = error?.message || "Nieznany błąd";
-      toast.error(`Błąd: ${errorMessage}. Spróbuj ponownie za chwilę.`);
+      if (error.name !== 'AbortError') {
+        console.error("TTS Error Details:", error);
+        toast.error(`Błąd: ${error.message || "Nieznany błąd"}`);
+      }
     } finally {
       setIsLoading(false);
       setIsPlaying(false);
       setCurrentChunk(null);
       setCurrentWordIndex(-1);
+      abortControllerRef.current = null;
+    }
+  };
+
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
     }
   };
 
@@ -257,8 +279,8 @@ export default function App() {
             </div>
 
             <Button 
-              onClick={() => handleSpeak()}
-              disabled={isLoading || !text.trim()}
+              onClick={() => isPlaying ? handleStop() : handleSpeak()}
+              disabled={(isLoading && !isPlaying) || !text.trim()}
               className="w-16 h-16 rounded-full bg-[#5A5A40] hover:bg-[#4A4A30] text-white shadow-xl shadow-[#5A5A40]/20 flex items-center justify-center transition-transform active:scale-95"
             >
               {isLoading ? (

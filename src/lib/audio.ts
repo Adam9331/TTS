@@ -5,10 +5,16 @@
 export async function playPCMAudio(
   base64Data: string, 
   sampleRate: number = 24000, 
-  onProgress?: (progress: number) => void
+  onProgress?: (progress: number) => void,
+  signal?: AbortSignal
 ) {
   const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
   
+  if (signal?.aborted) {
+    audioContext.close();
+    return;
+  }
+
   // Convert base64 to binary
   const binaryString = atob(base64Data);
   const len = binaryString.length;
@@ -38,11 +44,21 @@ export async function playPCMAudio(
   source.buffer = audioBuffer;
   source.connect(audioContext.destination);
   
+  const onAbort = () => {
+    source.stop();
+    audioContext.close();
+  };
+
+  if (signal) {
+    signal.addEventListener('abort', onAbort);
+  }
+
   source.start();
   const startTime = audioContext.currentTime;
 
   let animationFrame: number;
   const updateProgress = () => {
+    if (signal?.aborted) return;
     const elapsed = audioContext.currentTime - startTime;
     const progress = Math.min(elapsed / duration, 1);
     if (onProgress) onProgress(progress);
@@ -55,6 +71,9 @@ export async function playPCMAudio(
   return new Promise<void>((resolve) => {
     source.onended = () => {
       cancelAnimationFrame(animationFrame);
+      if (signal) {
+        signal.removeEventListener('abort', onAbort);
+      }
       audioContext.close();
       resolve();
     };

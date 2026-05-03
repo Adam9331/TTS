@@ -8,8 +8,8 @@ if (!apiKey) {
 
 export const ai = new GoogleGenAI({ apiKey: apiKey || "" });
 
-// gemini-2.5-flash-preview-tts is the specialized model for high-quality TTS
-export const TTS_MODEL = "gemini-2.5-flash-preview-tts";
+// gemini-3.1-flash-tts-preview is the specialized model for high-quality TTS
+export const TTS_MODEL = "gemini-3.1-flash-tts-preview";
 
 export type VoiceName = 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
 
