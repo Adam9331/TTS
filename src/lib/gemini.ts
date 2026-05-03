@@ -1,16 +1,3 @@
-import { GoogleGenAI } from "@google/genai";
-
-const apiKey = process.env.GEMINI_API_KEY;
-
-if (!apiKey) {
-  console.warn("GEMINI_API_KEY is not set. AI features will not work.");
-}
-
-export const ai = new GoogleGenAI({ apiKey: apiKey || "" });
-
-// gemini-3.1-flash-tts-preview is the specialized model for high-quality TTS
-export const TTS_MODEL = "gemini-3.1-flash-tts-preview";
-
 export type VoiceName = 'Puck' | 'Charon' | 'Kore' | 'Fenrir' | 'Zephyr';
 
 export const VOICES: { name: VoiceName; label: string; description: string }[] = [
@@ -20,3 +7,26 @@ export const VOICES: { name: VoiceName; label: string; description: string }[] =
   { name: 'Charon', label: 'Charon', description: 'Poważny i autorytatywny głos' },
   { name: 'Fenrir', label: 'Fenrir', description: 'Mocny i zdecydowany głos' },
 ];
+
+const API_URL = 'http://localhost:3001';
+
+export async function generateTTS(text: string, voice: VoiceName): Promise<string | null> {
+  try {
+    const response = await fetch(`${API_URL}/api/tts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text, voice }),
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || 'TTS request failed');
+    }
+
+    const data = await response.json();
+    return data.audio || null;
+  } catch (error) {
+    console.error('TTS API Error:', error);
+    throw error;
+  }
+}
