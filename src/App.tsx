@@ -26,6 +26,9 @@ export default function App() {
   const [isPaused, setIsPaused] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [bufferingProgress, setBufferingProgress] = useState(0);
+  const [loadingStatus, setLoadingStatus] = useState<string | null>(null);
+  const [chunksLoaded, setChunksLoaded] = useState<number[]>([]);
+  const [totalChunks, setTotalChunks] = useState(0);
 
   const [playbackProgress, setPlaybackProgress] = useState(0);
   const [totalDuration, setTotalDuration] = useState(0);
@@ -173,6 +176,9 @@ export default function App() {
     setCombinedAudioData(null);
     setPlaybackProgress(0);
     setTotalDuration(0);
+    setLoadingStatus("Przygotowuję tekst...");
+    setChunksLoaded([]);
+    setTotalChunks(0);
 
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
@@ -224,6 +230,8 @@ export default function App() {
 
       // Fetch all audio chunks
       const audioDataParts: string[] = [];
+      setTotalChunks(chunks.length);
+      setLoadingStatus(`Pobieram audio (0/${chunks.length})...`);
       console.log(`Starting to fetch ${chunks.length} chunks...`);
 
       for (let i = 0; i < chunks.length; i++) {
@@ -233,6 +241,7 @@ export default function App() {
         }
 
         const chunk = chunks[i];
+        setLoadingStatus(`Przetwarzam część ${i + 1} z ${chunks.length}...`);
         console.log(`Fetching chunk ${i + 1}/${chunks.length}:`, chunk.substring(0, 50) + '...');
 
         try {
@@ -246,13 +255,16 @@ export default function App() {
 
           if (audio) {
             audioDataParts.push(audio);
+            setChunksLoaded(prev => [...prev, i + 1]);
             setBufferingProgress(((i + 1) / chunks.length) * 100);
           }
         } catch (err) {
           console.error(`Error fetching chunk ${i + 1}:`, err);
+          setLoadingStatus(`Błąd przy części ${i + 1}...`);
         }
       }
 
+      setLoadingStatus("Łączę audio...");
       console.log(`Fetched ${audioDataParts.length}/${chunks.length} chunks`);
 
       if (signal.aborted) {
@@ -313,6 +325,9 @@ export default function App() {
     } finally {
       setIsLoading(false);
       setIsBuffering(false);
+      setLoadingStatus(null);
+      setChunksLoaded([]);
+      setTotalChunks(0);
     }
   };
 
@@ -514,15 +529,52 @@ export default function App() {
           </div>
 
           <AnimatePresence>
-            {isBuffering && (
-              <motion.p
-                initial={{ opacity: 0 }}
-                animate={{ opacity: 1 }}
-                exit={{ opacity: 0 }}
-                className="text-[9px] font-bold uppercase tracking-widest text-[#5A5A40]"
+            {(isLoading || isBuffering) && loadingStatus && (
+              <motion.div
+                initial={{ opacity: 0, y: 10 }}
+                animate={{ opacity: 1, y: 0 }}
+                exit={{ opacity: 0, y: -10 }}
+                className="flex flex-col items-center gap-3 bg-white/80 backdrop-blur-sm rounded-2xl px-6 py-4 shadow-lg border border-black/5"
               >
-                Przygotowanie audio: {Math.round(bufferingProgress)}%
-              </motion.p>
+                <p className="text-sm font-medium text-[#5A5A40]">
+                  {loadingStatus}
+                </p>
+
+                {totalChunks > 0 && (
+                  <div className="flex gap-2">
+                    {Array.from({ length: totalChunks }, (_, i) => {
+                      const chunkNum = i + 1;
+                      const isLoaded = chunksLoaded.includes(chunkNum);
+                      const isCurrent = !isLoaded && chunksLoaded.length === i;
+                      return (
+                        <motion.div
+                          key={i}
+                          initial={{ scale: 0.8 }}
+                          animate={{
+                            scale: isLoaded ? 1 : isCurrent ? [1, 1.1, 1] : 0.8,
+                            backgroundColor: isLoaded ? "#5A5A40" : isCurrent ? "#5A5A40" : "#e5e5e5"
+                          }}
+                          transition={{
+                            scale: isCurrent ? { repeat: Infinity, duration: 0.8 } : { duration: 0.2 }
+                          }}
+                          className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
+                          style={{ color: isLoaded || isCurrent ? "white" : "#999" }}
+                        >
+                          {isLoaded ? "✓" : chunkNum}
+                        </motion.div>
+                      );
+                    })}
+                  </div>
+                )}
+
+                <div className="w-48 h-1.5 bg-black/10 rounded-full overflow-hidden">
+                  <motion.div
+                    className="h-full bg-[#5A5A40] rounded-full"
+                    initial={{ width: "0%" }}
+                    animate={{ width: `${bufferingProgress}%` }}
+                  />
+                </div>
+              </motion.div>
             )}
           </AnimatePresence>
         </div>
