@@ -1,0 +1,6 @@
+{
+  "name": "Mówca AI - Polski TTS",
+  "description": "Zamień dowolny tekst na naturalnie brzmiący polski głos za pomocą Gemini AI.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
