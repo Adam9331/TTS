@@ -4,7 +4,7 @@ import { playPCMAudio } from "@/lib/audio";
 import { Modality } from "@google/genai";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
-import { Toaster } from "@/components/ui/sonner";
+import { Toaster } from "@/components/ui/toaster";
 import { toast } from "sonner";
 import { 
   Volume2, Play, Square, History, Trash2, Languages, Sparkles, 
