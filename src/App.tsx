@@ -25,7 +25,25 @@ export default function App() {
   const [isLoading, setIsLoading] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [isPlaying, setIsPlaying] = useState(false);
+  const [isBuffering, setIsBuffering] = useState(false);
+  const [bufferingProgress, setBufferingProgress] = useState(0);
   const [currentChunk, setCurrentChunk] = useState<string | null>(null);
+
+  useEffect(() => {
+    let interval: any;
+    if (isBuffering) {
+      setBufferingProgress(0);
+      interval = setInterval(() => {
+        setBufferingProgress(prev => {
+          if (prev < 90) return prev + (90 - prev) * 0.1;
+          return prev;
+        });
+      }, 200);
+    } else {
+      setBufferingProgress(0);
+    }
+    return () => clearInterval(interval);
+  }, [isBuffering]);
   const [currentWordIndex, setCurrentWordIndex] = useState(-1);
   const [isTrackingEnabled, setIsTrackingEnabled] = useState(true);
   const abortControllerRef = useRef<AbortController | null>(null);
@@ -37,6 +55,7 @@ export default function App() {
     }
 
     setIsLoading(true);
+    setIsBuffering(true);
     setIsPlaying(true);
     setCurrentWordIndex(-1);
     
@@ -46,17 +65,28 @@ export default function App() {
     }
     abortControllerRef.current = new AbortController();
     const signal = abortControllerRef.current.signal;
+    const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
 
     try {
       // Split text into intelligent chunks
+      // First chunk is small for instant response, subsequent are larger for efficiency
       const chunks: string[] = [];
       const sentences = textToSpeak.match(/[^.!?]+[.!?]+|.{1,1000}/g) || [textToSpeak];
+      
       let currentGroup = "";
+      let isFirstChunk = true;
+      const firstChunkLimit = 600; // Small first chunk for fast start
+      const normalChunkLimit = 3000; // Larger subsequent chunks
+
       for (const sentence of sentences) {
-        if ((currentGroup + sentence).length < 2500) { 
+        const limit = isFirstChunk ? firstChunkLimit : normalChunkLimit;
+        if ((currentGroup + sentence).length < limit) { 
           currentGroup += sentence;
         } else {
-          if (currentGroup) chunks.push(currentGroup.trim());
+          if (currentGroup) {
+            chunks.push(currentGroup.trim());
+            isFirstChunk = false;
+          }
           currentGroup = sentence;
         }
       }
@@ -116,10 +146,16 @@ export default function App() {
         const base64Audio = await audioPromise;
 
         if (signal.aborted) break;
+        
+        // Disable buffering indicator once we have the first chunk and start playing
+        if (i === 0) {
+          setIsBuffering(false);
+          setIsLoading(false);
+        }
+
         if (!base64Audio) continue;
 
         setCurrentChunk(chunk);
-        setIsLoading(false);
 
         const chunkOffset = globalWordOffset;
         const chunkWords = chunk.split(/\s+/).filter(w => w.length > 0);
@@ -143,7 +179,7 @@ export default function App() {
               }
             }
           }
-        }, signal);
+        }, signal, audioContext);
 
         globalWordOffset += chunkWords.length;
       }
@@ -153,7 +189,9 @@ export default function App() {
         toast.error(`Błąd: ${error.message || "Nieznany błąd"}`);
       }
     } finally {
+      audioContext.close().catch(() => {});
       setIsLoading(false);
+      setIsBuffering(false);
       setIsPlaying(false);
       setCurrentChunk(null);
       setCurrentWordIndex(-1);
@@ -176,6 +214,12 @@ export default function App() {
     setText(itemText);
     toast.success("Tekst skopiowany do edytora");
   };
+
+  // Estimate duration: ~160 words per minute
+  const wordCount = text.trim().split(/\s+/).filter(w => w.length > 0).length;
+  const estimatedSeconds = Math.ceil((wordCount / 160) * 60);
+  const minutes = Math.floor(estimatedSeconds / 60);
+  const seconds = estimatedSeconds % 60;
 
   return (
     <div className="min-h-screen bg-[#FBF9F4] text-[#1A1A1A] font-sans selection:bg-[#5A5A40]/10 selection:text-[#5A5A40]">
@@ -305,16 +349,48 @@ export default function App() {
 
           <div className="w-full max-w-md flex flex-col gap-2">
             <div className="flex justify-between text-[10px] font-bold uppercase tracking-[0.2em] text-black/20">
-              <span>20 z 407</span>
-              <span>4 str. do końca rozdziału</span>
+              <span>{wordCount} słów</span>
+              <span>
+                {estimatedSeconds > 0 
+                  ? `~ ${minutes} min ${seconds} sek nagrania` 
+                  : "0 min 0 sek"}
+              </span>
             </div>
-            <div className="h-1 bg-black/5 rounded-full overflow-hidden">
+            
+            <div className="h-1 bg-black/5 rounded-full overflow-hidden relative">
+              {/* Buffering Progress Bar (First chunk) */}
+              <AnimatePresence>
+                {isBuffering && (
+                  <motion.div 
+                    initial={{ width: "0%" }}
+                    animate={{ width: `${bufferingProgress}%` }}
+                    exit={{ width: "100%", transition: { duration: 0.2 } }}
+                    className="absolute inset-0 bg-[#5A5A40]/40 z-10"
+                  />
+                )}
+              </AnimatePresence>
+
+              {/* Main reading progress */}
               <motion.div 
-                className="h-full bg-[#5A5A40]/20"
+                className="h-full bg-[#5A5A40]"
                 initial={{ width: "0%" }}
-                animate={{ width: "15%" }}
+                animate={{ 
+                  width: isPlaying && !isBuffering 
+                    ? `${Math.min(100, (currentWordIndex / Math.max(1, wordCount)) * 100)}%` 
+                    : "0%" 
+                }}
+                transition={{ type: "spring", bounce: 0, duration: 0.5 }}
               />
             </div>
+            {isBuffering && (
+              <motion.p 
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                className="text-[9px] font-bold uppercase tracking-widest text-[#5A5A40] text-center mt-1"
+              >
+                Przygotowanie audio: {Math.round(bufferingProgress)}%
+              </motion.p>
+            )}
           </div>
         </div>
       </main>

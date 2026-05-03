@@ -6,12 +6,13 @@ export async function playPCMAudio(
   base64Data: string, 
   sampleRate: number = 24000, 
   onProgress?: (progress: number) => void,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  passedAudioContext?: AudioContext
 ) {
-  const audioContext = new (window.AudioContext || (window as any).webkitAudioContext)();
+  const audioContext = passedAudioContext || new (window.AudioContext || (window as any).webkitAudioContext)();
   
   if (signal?.aborted) {
-    audioContext.close();
+    if (!passedAudioContext) audioContext.close();
     return;
   }
 
@@ -74,7 +75,9 @@ export async function playPCMAudio(
       if (signal) {
         signal.removeEventListener('abort', onAbort);
       }
-      audioContext.close();
+      if (!passedAudioContext) {
+        audioContext.close();
+      }
       resolve();
     };
   });
