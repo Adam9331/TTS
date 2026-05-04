@@ -126,18 +126,17 @@ export default function App() {
     
     try {
       const audioBase64 = await generateTTS(nextChunk.text, selectedVoice);
-      if (abortControllerRef.current.signal.aborted) return;
+      if (abortControllerRef.current?.signal.aborted) return;
       
       if (audioBase64 && audioContextRef.current) {
         nextChunk.buffer = await decodeAudioBase64(audioContextRef.current, audioBase64);
         nextChunk.status = 'ready';
         
-        // Save raw base64 momentarily for visualizer if it's the first playing chunk
-        if (nextChunk.index === currentChunkIndexRef.current || currentChunkIndexRef.current === -1) {
+        // IMMEDIATE ACTION: If this is the first chunk, or we are waiting for it, start playback NOW
+        if (nextChunk.index === 0 || (isPlaying && activeSourcesRef.current.size === 0)) {
              setCurrentVisualData(audioBase64);
+             scheduleNextChunks();
         }
-        
-        scheduleNextChunks();
       } else {
         nextChunk.status = 'error';
       }
@@ -172,6 +171,7 @@ export default function App() {
           playbackStartTimeRef.current = nextStartTimeRef.current;
           setIsBuffering(false);
           setIsLoading(false);
+          setLoadingStatus(null);
         }
 
         // Only schedule if within preload window
