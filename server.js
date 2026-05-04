@@ -60,13 +60,22 @@ app.post('/api/tts', async (req, res) => {
       },
     });
 
-    const audioData = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-
-    if (!audioData) {
-      return res.status(500).json({ error: 'No audio data received' });
+    const parts = response.candidates?.[0]?.content?.parts || [];
+    
+    // Combine all audio parts safely by decoding to buffers first
+    const buffers = [];
+    for (const part of parts) {
+      if (part.inlineData && part.inlineData.data) {
+        buffers.push(Buffer.from(part.inlineData.data, 'base64'));
+      }
     }
 
-    res.json({ audio: audioData });
+    if (buffers.length === 0) {
+      return res.status(500).json({ error: 'No audio data received from model' });
+    }
+
+    const combinedAudioBuffer = Buffer.concat(buffers);
+    res.json({ audio: combinedAudioBuffer.toString('base64') });
   } catch (error) {
     console.error('TTS Error:', error);
     res.status(500).json({ error: error.message || 'TTS generation failed' });
