@@ -181,7 +181,7 @@ export default function App() {
 
     for (let i = 0; i < queue.length; i++) {
       const chunk = queue[i];
-      if (chunk.status === 'ready' && !activeSourcesRef.current.has(chunk.index)) {
+      if (chunk.status === 'ready') {
         
         if (nextStartTimeRef.current === 0) {
           nextStartTimeRef.current = ctx.currentTime + 0.2;
@@ -192,6 +192,7 @@ export default function App() {
         }
 
         if (nextStartTimeRef.current <= ctx.currentTime + PRELOAD_TIME) {
+          chunk.status = 'scheduled'; // FIXED: Prevent loop
           const source = ctx.createBufferSource();
           source.buffer = chunk.buffer;
           source.connect(ctx.destination);
