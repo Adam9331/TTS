@@ -8,7 +8,8 @@ export const VOICES: { name: VoiceName; label: string; description: string }[] =
   { name: 'Fenrir', label: 'Fenrir', description: 'Mocny i zdecydowany głos' },
 ];
 
-const API_URL = 'http://localhost:3001';
+// Use relative URL in production, localhost in development
+const API_URL = import.meta.env.DEV ? 'http://localhost:3001' : '';
 
 export async function generateTTS(text: string, voice: VoiceName): Promise<string | null> {
   try {

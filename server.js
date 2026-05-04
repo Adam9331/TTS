@@ -2,8 +2,13 @@ import express from 'express';
 import cors from 'cors';
 import { GoogleGenAI } from '@google/genai';
 import dotenv from 'dotenv';
+import path from 'path';
+import { fileURLToPath } from 'url';
 
 dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
 const app = express();
 app.use(cors());
@@ -11,6 +16,7 @@ app.use(express.json({ limit: '10mb' }));
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
+// API endpoint
 app.post('/api/tts', async (req, res) => {
   try {
     const { text, voice = 'Kore' } = req.body;
@@ -45,7 +51,16 @@ app.post('/api/tts', async (req, res) => {
   }
 });
 
-const PORT = process.env.API_PORT || 3001;
-app.listen(PORT, () => {
-  console.log(`TTS API server running on http://localhost:${PORT}`);
+// Serve static files in production
+const distPath = path.join(__dirname, 'dist');
+app.use(express.static(distPath));
+
+// SPA fallback - serve index.html for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(distPath, 'index.html'));
+});
+
+const PORT = process.env.PORT || 3001;
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`Server running on http://0.0.0.0:${PORT}`);
 });
