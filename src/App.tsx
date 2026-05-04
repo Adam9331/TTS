@@ -17,6 +17,14 @@ interface HistoryItem {
   voice: string;
 }
 
+interface AudioChunk {
+  index: number;
+  text: string;
+  buffer: AudioBuffer | null;
+  status: 'pending' | 'fetching' | 'ready' | 'error';
+  wordsCount: number;
+}
+
 export default function App() {
   const [text, setText] = useState("");
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>("Kore");
@@ -25,348 +33,326 @@ export default function App() {
   const [isPlaying, setIsPlaying] = useState(false);
   const [isPaused, setIsPaused] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
-  const [bufferingProgress, setBufferingProgress] = useState(0);
   const [loadingStatus, setLoadingStatus] = useState<string | null>(null);
-  const [chunksLoaded, setChunksLoaded] = useState<number[]>([]);
-  const [totalChunks, setTotalChunks] = useState(0);
 
   const [playbackProgress, setPlaybackProgress] = useState(0);
-  const [totalDuration, setTotalDuration] = useState(0);
-  const [combinedAudioData, setCombinedAudioData] = useState<string | null>(null);
   const [currentWordIndex, setCurrentWordIndex] = useState(-1);
   const [isTrackingEnabled, setIsTrackingEnabled] = useState(true);
 
+  // Streaming State Refs
   const audioContextRef = useRef<AudioContext | null>(null);
-  const sourceNodeRef = useRef<AudioBufferSourceNode | null>(null);
-  const audioBufferRef = useRef<AudioBuffer | null>(null);
-  const startTimeRef = useRef(0);
-  const pauseTimeRef = useRef(0);
-  const animationFrameRef = useRef<number>(0);
+  const activeSourcesRef = useRef<Map<number, AudioBufferSourceNode>>(new Map());
+  const chunksQueueRef = useRef<AudioChunk[]>([]);
   const abortControllerRef = useRef<AbortController | null>(null);
-  const totalWordsRef = useRef(0);
-
-  useEffect(() => {
-    let interval: ReturnType<typeof setInterval>;
-    if (isBuffering) {
-      setBufferingProgress(0);
-      interval = setInterval(() => {
-        setBufferingProgress(prev => {
-          if (prev < 90) return prev + (90 - prev) * 0.1;
-          return prev;
-        });
-      }, 200);
-    } else {
-      setBufferingProgress(0);
-    }
-    return () => clearInterval(interval);
-  }, [isBuffering]);
+  const currentChunkIndexRef = useRef(-1);
+  const nextStartTimeRef = useRef(0);
+  const globalWordsPlayedRef = useRef(0);
+  const animationFrameRef = useRef<number>(0);
+  const playbackStartTimeRef = useRef(0);
+  
+  // Waveform state for the current active chunk
+  const [currentVisualData, setCurrentVisualData] = useState<string | null>(null);
+  const [currentChunkDuration, setCurrentChunkDuration] = useState(0);
+  const [totalEstimatedDuration, setTotalEstimatedDuration] = useState(0);
 
   useEffect(() => {
     return () => {
+      stopPlayback();
       if (audioContextRef.current) {
         audioContextRef.current.close();
-      }
-      if (animationFrameRef.current) {
-        cancelAnimationFrame(animationFrameRef.current);
       }
     };
   }, []);
 
   const stopPlayback = () => {
-    if (sourceNodeRef.current) {
-      try {
-        sourceNodeRef.current.stop();
-      } catch {}
-      sourceNodeRef.current = null;
-    }
-    if (animationFrameRef.current) {
-      cancelAnimationFrame(animationFrameRef.current);
-    }
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
+    
+    activeSourcesRef.current.forEach(source => {
+      try { source.stop(); } catch {}
+    });
+    activeSourcesRef.current.clear();
+    
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+    }
+
     setIsPlaying(false);
     setIsPaused(false);
+    setIsLoading(false);
+    setIsBuffering(false);
+    setLoadingStatus(null);
     setCurrentWordIndex(-1);
+    setPlaybackProgress(0);
+    setCurrentVisualData(null);
+    
+    chunksQueueRef.current = [];
+    currentChunkIndexRef.current = -1;
+    nextStartTimeRef.current = 0;
+    globalWordsPlayedRef.current = 0;
   };
 
-  const playAudioBuffer = async (buffer: AudioBuffer, startPosition: number = 0) => {
-    if (!audioContextRef.current) return;
+  const decodeAudioBase64 = async (ctx: AudioContext, base64: string): Promise<AudioBuffer> => {
+    const binaryString = atob(base64);
+    const bytes = new Uint8Array(binaryString.length);
+    for (let i = 0; i < binaryString.length; i++) {
+      bytes[i] = binaryString.charCodeAt(i);
+    }
+    
+    const numSamples = bytes.length / 2;
+    const floatData = new Float32Array(numSamples);
+    const dataView = new DataView(bytes.buffer);
 
+    for (let i = 0; i < numSamples; i++) {
+      if (i * 2 + 1 < bytes.length) {
+        floatData[i] = dataView.getInt16(i * 2, true) / 32768;
+      }
+    }
+
+    const buffer = ctx.createBuffer(1, numSamples, 24000);
+    buffer.getChannelData(0).set(floatData);
+    return buffer;
+  };
+
+  const fetchNextChunk = async () => {
+    const queue = chunksQueueRef.current;
+    // Find next pending chunk
+    const nextChunk = queue.find(c => c.status === 'pending');
+    if (!nextChunk || !abortControllerRef.current) return;
+
+    nextChunk.status = 'fetching';
+    setLoadingStatus(`Przygotowuję fragment ${nextChunk.index + 1}/${queue.length}...`);
+    
+    try {
+      const audioBase64 = await generateTTS(nextChunk.text, selectedVoice);
+      if (abortControllerRef.current.signal.aborted) return;
+      
+      if (audioBase64 && audioContextRef.current) {
+        nextChunk.buffer = await decodeAudioBase64(audioContextRef.current, audioBase64);
+        nextChunk.status = 'ready';
+        
+        // Save raw base64 momentarily for visualizer if it's the first playing chunk
+        if (nextChunk.index === currentChunkIndexRef.current || currentChunkIndexRef.current === -1) {
+             setCurrentVisualData(audioBase64);
+        }
+        
+        scheduleNextChunks();
+      } else {
+        nextChunk.status = 'error';
+      }
+    } catch (e: any) {
+      if (e.name !== 'AbortError') {
+        nextChunk.status = 'error';
+        toast.error(`Błąd pobierania frag. ${nextChunk.index + 1}`);
+      }
+    }
+    
+    // Proactively fetch another chunk if there's no ongoing fetch
+    if (queue.some(c => c.status === 'pending') && !queue.some(c => c.status === 'fetching')) {
+      fetchNextChunk();
+    }
+  };
+
+  const scheduleNextChunks = () => {
+    if (!audioContextRef.current || !isPlaying) return;
     const ctx = audioContextRef.current;
+    
+    const PRELOAD_TIME = 2.0; // schedule chunks up to 2 seconds in advance
+    
+    // Find chunks that are ready but not scheduled yet
+    const queue = chunksQueueRef.current;
+    for (let i = 0; i < queue.length; i++) {
+      const chunk = queue[i];
+      if (chunk.status === 'ready' && !activeSourcesRef.current.has(chunk.index)) {
+        
+        // If it's the very first chunk being played
+        if (nextStartTimeRef.current === 0) {
+          nextStartTimeRef.current = ctx.currentTime + 0.1;
+          playbackStartTimeRef.current = nextStartTimeRef.current;
+          setIsBuffering(false);
+          setIsLoading(false);
+        }
 
-    // Resume if suspended
-    if (ctx.state === 'suspended') {
-      await ctx.resume();
+        // Only schedule if within preload window
+        if (nextStartTimeRef.current <= ctx.currentTime + PRELOAD_TIME) {
+          const source = ctx.createBufferSource();
+          source.buffer = chunk.buffer;
+          source.connect(ctx.destination);
+          
+          source.start(nextStartTimeRef.current);
+          activeSourcesRef.current.set(chunk.index, source);
+          
+          // Cleanup when chunk finishes
+          source.onended = () => {
+             activeSourcesRef.current.delete(chunk.index);
+             globalWordsPlayedRef.current += chunk.wordsCount;
+             
+             if (chunk.index === queue.length - 1) {
+                 stopPlayback(); // All chunks finished
+             }
+          };
+
+          nextStartTimeRef.current += chunk.buffer!.duration;
+        }
+      }
     }
-
-    // Stop previous source
-    if (sourceNodeRef.current) {
-      try {
-        sourceNodeRef.current.stop();
-      } catch {}
+    
+    // Trigger next fetch if queue is running empty
+    if (queue.some(c => c.status === 'pending') && !queue.some(c => c.status === 'fetching')) {
+      fetchNextChunk();
     }
-
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-    sourceNodeRef.current = source;
-
-    const startOffset = startPosition * buffer.duration;
-    startTimeRef.current = ctx.currentTime - startOffset;
-
-    source.start(0, startOffset);
-    setIsPlaying(true);
-    setIsPaused(false);
-
-    console.log('Playing audio:', { startPosition, duration: buffer.duration, state: ctx.state });
-
-    const updateProgress = () => {
-      if (!audioContextRef.current || !buffer) return;
-
-      const elapsed = audioContextRef.current.currentTime - startTimeRef.current;
-      const progress = Math.min(elapsed / buffer.duration, 1);
-
-      setPlaybackProgress(progress);
-
-      if (isTrackingEnabled && totalWordsRef.current > 0) {
-        const wordIdx = Math.floor(progress * totalWordsRef.current);
-        setCurrentWordIndex(wordIdx);
-      }
-
-      if (progress < 1 && sourceNodeRef.current) {
-        animationFrameRef.current = requestAnimationFrame(updateProgress);
-      }
-    };
-
-    animationFrameRef.current = requestAnimationFrame(updateProgress);
-
-    source.onended = () => {
-      cancelAnimationFrame(animationFrameRef.current);
-      if (sourceNodeRef.current === source) {
-        setIsPlaying(false);
-        setIsPaused(false);
-        setPlaybackProgress(1);
-        setCurrentWordIndex(-1);
-      }
-    };
   };
 
-  const handleSeek = (progress: number) => {
-    if (!audioBufferRef.current) return;
-    pauseTimeRef.current = progress * audioBufferRef.current.duration;
-    playAudioBuffer(audioBufferRef.current, progress);
+  const updateProgressLoop = () => {
+    if (!audioContextRef.current || !isPlaying) return;
+    const ctx = audioContextRef.current;
+    const queue = chunksQueueRef.current;
+    
+    // Determine which chunk is currently playing based on time
+    let timeAccumulator = playbackStartTimeRef.current;
+    let playingIdx = -1;
+    let timeIntoCurrentChunk = 0;
+    
+    for (let i = 0; i < queue.length; i++) {
+      const chunk = queue[i];
+      if (chunk.buffer) {
+        const chunkEnd = timeAccumulator + chunk.buffer.duration;
+        if (ctx.currentTime >= timeAccumulator && ctx.currentTime < chunkEnd) {
+          playingIdx = i;
+          timeIntoCurrentChunk = ctx.currentTime - timeAccumulator;
+          break;
+        }
+        timeAccumulator += chunk.buffer.duration;
+      } else {
+        break; // Reached uncharted territory
+      }
+    }
+
+    if (playingIdx !== -1 && playingIdx !== currentChunkIndexRef.current) {
+       currentChunkIndexRef.current = playingIdx;
+       setCurrentChunkDuration(queue[playingIdx].buffer!.duration);
+       // We can't trivially reconstruct base64 from audiobuffer here for waveform, 
+       // so the live waveform will represent the current context state, or we omit the base64 update to avoid lag.
+    }
+
+    if (playingIdx !== -1) {
+       const chunkProgress = timeIntoCurrentChunk / queue[playingIdx].buffer!.duration;
+       setPlaybackProgress(chunkProgress);
+
+       if (isTrackingEnabled) {
+          let wordsBefore = 0;
+          for (let i = 0; i < playingIdx; i++) wordsBefore += queue[i].wordsCount;
+          
+          const currentChunkWord = Math.floor(chunkProgress * queue[playingIdx].wordsCount);
+          setCurrentWordIndex(wordsBefore + currentChunkWord);
+       }
+    }
+
+    animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
   };
 
-  const handleSpeak = async (textToSpeak: string = text) => {
-    if (!textToSpeak.trim()) {
+  const handleSpeak = async () => {
+    if (!text.trim()) {
       toast.error("Wprowadź tekst do przeczytania");
-      return;
-    }
-
-    // Prevent double invocation
-    if (isLoading) {
-      console.log('Already loading, skipping...');
       return;
     }
 
     stopPlayback();
     setIsLoading(true);
     setIsBuffering(true);
-    setCombinedAudioData(null);
-    setPlaybackProgress(0);
-    setTotalDuration(0);
-    setLoadingStatus("Przygotowuję tekst...");
-    setChunksLoaded([]);
-    setTotalChunks(0);
-
+    
     abortControllerRef.current = new AbortController();
-    const signal = abortControllerRef.current.signal;
 
-    try {
-      // Create audio context
-      if (audioContextRef.current) {
-        await audioContextRef.current.close();
-      }
-      audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
-
-      // Count words
-      const words = textToSpeak.trim().split(/\s+/).filter(w => w.length > 0);
-      totalWordsRef.current = words.length;
-
-      // Split text into chunks - smaller chunks for better reliability
-      const chunks: string[] = [];
-      // Split by sentences, but keep them together up to a limit
-      const sentences = textToSpeak.match(/[^.!?\n]+[.!?\n]+|.{1,500}/g) || [textToSpeak];
-
-      let currentGroup = "";
-      const chunkLimit = 800; // Safer limit for Gemini TTS
-
-      for (const sentence of sentences) {
-        if ((currentGroup + sentence).length < chunkLimit) {
-          currentGroup += sentence;
-        } else {
-          if (currentGroup) {
-            chunks.push(currentGroup.trim());
-          }
-          currentGroup = sentence;
-          // If a single sentence is still too long, split it further
-          while (currentGroup.length > chunkLimit) {
-            chunks.push(currentGroup.substring(0, chunkLimit).trim());
-            currentGroup = currentGroup.substring(chunkLimit);
-          }
-        }
-      }
-      if (currentGroup.trim()) chunks.push(currentGroup.trim());
-
-      // Add to history
-      if (textToSpeak === text) {
-        const newItem: HistoryItem = {
-          id: crypto.randomUUID(),
-          text: textToSpeak,
-          timestamp: Date.now(),
-          voice: selectedVoice,
-        };
-        setHistory(prev => [newItem, ...prev].slice(0, 10));
-      }
-
-      // Fetch all audio chunks
-      const audioDataParts: string[] = [];
-      setTotalChunks(chunks.length);
-      setLoadingStatus(`Pobieram audio (0/${chunks.length})...`);
-
-      for (let i = 0; i < chunks.length; i++) {
-        if (signal.aborted) break;
-
-        const chunk = chunks[i];
-        setLoadingStatus(`Przetwarzam część ${i + 1} z ${chunks.length}...`);
-
-        try {
-          const audio = await generateTTS(chunk, selectedVoice);
-          if (signal.aborted) break;
-
-          if (audio) {
-            audioDataParts.push(audio);
-            setChunksLoaded(prev => [...prev, i + 1]);
-            setBufferingProgress(((i + 1) / chunks.length) * 100);
-          }
-        } catch (err) {
-          console.error(`Error fetching chunk ${i + 1}:`, err);
-        }
-      }
-
-      if (signal.aborted || audioDataParts.length === 0) {
-        setIsLoading(false);
-        setIsBuffering(false);
-        return;
-      }
-
-      setLoadingStatus("Łączę audio...");
-      
-      // Efficiently combine audio data
-      const byteArrays = audioDataParts.map(part => {
-        const binaryString = atob(part);
-        const bytes = new Uint8Array(binaryString.length);
-        for (let i = 0; i < binaryString.length; i++) {
-          bytes[i] = binaryString.charCodeAt(i);
-        }
-        return bytes;
-      });
-
-      const totalLength = byteArrays.reduce((acc, curr) => acc + curr.length, 0);
-      const combinedBytes = new Uint8Array(totalLength);
-      let offset = 0;
-      for (const byteArray of byteArrays) {
-        combinedBytes.set(byteArray, offset);
-        offset += byteArray.length;
-      }
-
-      // Set combined audio for waveform visualization
-      // Using a more efficient way to create base64 for large data
-      const blob = new Blob([combinedBytes], { type: 'audio/pcm' });
-      const reader = new FileReader();
-      reader.onloadend = () => {
-        const base64data = reader.result as string;
-        setCombinedAudioData(base64data.split(',')[1]);
-      };
-      reader.readAsDataURL(blob);
-
-      // Create AudioBuffer from raw PCM 16-bit
-      const numSamples = combinedBytes.length / 2;
-      const floatData = new Float32Array(numSamples);
-      const dataView = new DataView(combinedBytes.buffer);
-
-      for (let i = 0; i < numSamples; i++) {
-        // Ensure we don't go out of bounds
-        if (i * 2 + 1 < combinedBytes.length) {
-          const sample = dataView.getInt16(i * 2, true);
-          floatData[i] = sample / 32768;
-        }
-      }
-
-      const buffer = audioContextRef.current.createBuffer(1, numSamples, 24000);
-      buffer.getChannelData(0).set(floatData);
-      audioBufferRef.current = buffer;
-
-      setTotalDuration(buffer.duration);
-      console.log('Audio ready:', { samples: numSamples, duration: buffer.duration });
-
-      // Start playback
-      await playAudioBuffer(buffer, 0);
-
-    } catch (error: any) {
-      if (error.name !== 'AbortError') {
-        console.error("TTS Error:", error);
-        toast.error(`Błąd: ${error.message || "Nieznany błąd"}`);
-      }
-    } finally {
-      setIsLoading(false);
-      setIsBuffering(false);
-      setLoadingStatus(null);
-      setChunksLoaded([]);
-      setTotalChunks(0);
+    if (audioContextRef.current) {
+      await audioContextRef.current.close();
     }
+    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+
+    const words = text.trim().split(/\s+/).filter(w => w.length > 0);
+    const wordsPerSec = 160 / 60;
+    setTotalEstimatedDuration(words.length / wordsPerSec);
+
+    // Prepare Chunks
+    const chunks: AudioChunk[] = [];
+    const sentences = text.match(/[^.!?\n]+[.!?\n]+|.{1,500}/g) || [text];
+    let currentGroup = "";
+    const chunkLimit = 800; 
+
+    for (const sentence of sentences) {
+      if ((currentGroup + sentence).length < chunkLimit) {
+        currentGroup += sentence;
+      } else {
+        if (currentGroup.trim()) {
+          chunks.push({
+             index: chunks.length,
+             text: currentGroup.trim(),
+             buffer: null,
+             status: 'pending',
+             wordsCount: currentGroup.trim().split(/\s+/).length
+          });
+        }
+        currentGroup = sentence;
+      }
+    }
+    if (currentGroup.trim()) {
+      chunks.push({
+         index: chunks.length,
+         text: currentGroup.trim(),
+         buffer: null,
+         status: 'pending',
+         wordsCount: currentGroup.trim().split(/\s+/).length
+      });
+    }
+
+    chunksQueueRef.current = chunks;
+    
+    // Add to history
+    const newItem: HistoryItem = {
+      id: crypto.randomUUID(),
+      text,
+      timestamp: Date.now(),
+      voice: selectedVoice,
+    };
+    setHistory(prev => [newItem, ...prev].slice(0, 10));
+
+    setIsPlaying(true);
+    
+    // Start playback loop logic
+    fetchNextChunk();
+    animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
   };
 
-  const handlePlayPause = () => {
-    if (!audioBufferRef.current || !audioContextRef.current) {
+  const handlePlayPause = async () => {
+    if (!audioContextRef.current || chunksQueueRef.current.length === 0) {
       handleSpeak();
       return;
     }
 
-    if (isPlaying) {
-      // Pause
-      pauseTimeRef.current = audioContextRef.current.currentTime - startTimeRef.current;
-      if (sourceNodeRef.current) {
-        try {
-          sourceNodeRef.current.stop();
-        } catch {}
-        sourceNodeRef.current = null;
-      }
-      cancelAnimationFrame(animationFrameRef.current);
+    const ctx = audioContextRef.current;
+    if (ctx.state === 'running') {
+      await ctx.suspend();
       setIsPlaying(false);
       setIsPaused(true);
-    } else if (isPaused && audioBufferRef.current) {
-      // Resume
-      playAudioBuffer(audioBufferRef.current, pauseTimeRef.current / audioBufferRef.current.duration);
-    } else if (audioBufferRef.current) {
-      // Start fresh
-      playAudioBuffer(audioBufferRef.current, 0);
+      cancelAnimationFrame(animationFrameRef.current);
+    } else if (ctx.state === 'suspended') {
+      await ctx.resume();
+      setIsPlaying(true);
+      setIsPaused(false);
+      animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
+      scheduleNextChunks(); // Make sure the pipeline continues
     }
   };
 
-  const handleStop = () => {
-    stopPlayback();
-    setPlaybackProgress(0);
-    pauseTimeRef.current = 0;
-    audioBufferRef.current = null;
-    setCombinedAudioData(null);
+  const handleSeek = (progress: number) => {
+    // Advanced seeking in a streamed setup is complex. 
+    // For this prototype, we'll disable seeking or only allow it if fully buffered.
+    toast.info("Przewijanie jest wyłączone w trybie odtwarzania na żywo.");
   };
 
   const wordCount = text.trim().split(/\s+/).filter(w => w.length > 0).length;
-  const estimatedSeconds = Math.ceil((wordCount / 160) * 60);
-  const minutes = Math.floor(estimatedSeconds / 60);
-  const seconds = estimatedSeconds % 60;
+  const minutes = Math.floor(totalEstimatedDuration / 60);
+  const seconds = Math.floor(totalEstimatedDuration % 60);
 
   return (
     <div className="min-h-screen bg-[#FBF9F4] text-[#1A1A1A] font-sans selection:bg-[#5A5A40]/10 selection:text-[#5A5A40]">
@@ -387,7 +373,7 @@ export default function App() {
 
         <div className="absolute left-1/2 -translate-x-1/2 text-center">
           <h2 className="text-xs font-bold uppercase tracking-[0.2em] text-black/40 truncate max-w-[300px]">
-            {text ? "Aria Reader" : "Aria Reader"}
+            {text ? "Aria Reader (Live Streaming)" : "Aria Reader"}
           </h2>
         </div>
 
@@ -418,11 +404,11 @@ export default function App() {
 
         <div className="flex-grow flex flex-col">
           <h1 className="font-serif text-5xl font-bold text-[#000080] mb-12 text-center tracking-tight leading-tight">
-            Polski Czytnik TTS
+            Polski Czytnik TTS (Live)
           </h1>
 
           <div className="relative flex-grow">
-            {(isPlaying || isPaused) && isTrackingEnabled && combinedAudioData ? (
+            {(isPlaying || isPaused) && isTrackingEnabled ? (
               <div className="text-2xl leading-[1.8] font-serif text-black/80 text-justify whitespace-pre-wrap">
                 {text.split(/\s+/).map((word, i) => {
                   const isCurrentWord = i === currentWordIndex;
@@ -444,7 +430,7 @@ export default function App() {
               </div>
             ) : (
               <textarea
-                placeholder="Wklej tutaj tekst do przeczytania..."
+                placeholder="Wklej tutaj dowolnie długi tekst (nawet 15 minut czytania!). Od razu zacznie go czytać, pobierając resztę w tle..."
                 className="w-full min-h-[500px] bg-transparent text-2xl leading-[1.8] font-serif text-black/80 text-justify resize-none border-none outline-none placeholder:text-black/10"
                 value={text}
                 onChange={(e) => setText(e.target.value)}
@@ -457,12 +443,15 @@ export default function App() {
 
           <div className="w-full max-w-2xl">
             <Waveform
-              audioData={combinedAudioData}
+              audioData={currentVisualData}
               isPlaying={isPlaying}
               progress={playbackProgress}
-              duration={totalDuration || estimatedSeconds}
+              duration={currentChunkDuration}
               onSeek={handleSeek}
             />
+            {loadingStatus && (
+               <p className="text-xs text-center text-black/30 mt-1 uppercase font-bold tracking-wider">{loadingStatus}</p>
+            )}
           </div>
 
           <div className="flex items-center gap-8">
@@ -480,10 +469,10 @@ export default function App() {
             <div className="flex items-center gap-2">
               <Button
                 onClick={handlePlayPause}
-                disabled={isLoading || !text.trim()}
+                disabled={isLoading && isBuffering && !isPlaying}
                 className="w-16 h-16 rounded-full bg-[#5A5A40] hover:bg-[#4A4A30] text-white shadow-xl shadow-[#5A5A40]/20 flex items-center justify-center transition-transform active:scale-95"
               >
-                {isLoading ? (
+                {isBuffering ? (
                   <Sparkles className="w-6 h-6 animate-pulse" />
                 ) : isPlaying ? (
                   <Pause className="w-6 h-6 fill-current" />
@@ -492,9 +481,9 @@ export default function App() {
                 )}
               </Button>
 
-              {(isPlaying || isPaused || combinedAudioData) && (
+              {(isPlaying || isPaused || currentChunkIndexRef.current >= 0) && (
                 <Button
-                  onClick={handleStop}
+                  onClick={stopPlayback}
                   variant="ghost"
                   className="w-12 h-12 rounded-full hover:bg-black/5"
                 >
@@ -517,63 +506,10 @@ export default function App() {
           <div className="flex gap-6 text-[10px] font-bold uppercase tracking-[0.2em] text-black/30">
             <span>{wordCount} słów</span>
             <span>
-              {totalDuration > 0
-                ? `${Math.floor(totalDuration / 60)} min ${Math.floor(totalDuration % 60)} sek`
-                : estimatedSeconds > 0
-                  ? `~ ${minutes} min ${seconds} sek`
-                  : "0 min 0 sek"}
+              ~ {minutes} min {seconds} sek
             </span>
           </div>
 
-          <AnimatePresence>
-            {(isLoading || isBuffering) && loadingStatus && (
-              <motion.div
-                initial={{ opacity: 0, y: 10 }}
-                animate={{ opacity: 1, y: 0 }}
-                exit={{ opacity: 0, y: -10 }}
-                className="flex flex-col items-center gap-3 bg-white/80 backdrop-blur-sm rounded-2xl px-6 py-4 shadow-lg border border-black/5"
-              >
-                <p className="text-sm font-medium text-[#5A5A40]">
-                  {loadingStatus}
-                </p>
-
-                {totalChunks > 0 && (
-                  <div className="flex gap-2">
-                    {Array.from({ length: totalChunks }, (_, i) => {
-                      const chunkNum = i + 1;
-                      const isLoaded = chunksLoaded.includes(chunkNum);
-                      const isCurrent = !isLoaded && chunksLoaded.length === i;
-                      return (
-                        <motion.div
-                          key={i}
-                          initial={{ scale: 0.8 }}
-                          animate={{
-                            scale: isLoaded ? 1 : isCurrent ? [1, 1.1, 1] : 0.8,
-                            backgroundColor: isLoaded ? "#5A5A40" : isCurrent ? "#5A5A40" : "#e5e5e5"
-                          }}
-                          transition={{
-                            scale: isCurrent ? { repeat: Infinity, duration: 0.8 } : { duration: 0.2 }
-                          }}
-                          className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold"
-                          style={{ color: isLoaded || isCurrent ? "white" : "#999" }}
-                        >
-                          {isLoaded ? "✓" : chunkNum}
-                        </motion.div>
-                      );
-                    })}
-                  </div>
-                )}
-
-                <div className="w-48 h-1.5 bg-black/10 rounded-full overflow-hidden">
-                  <motion.div
-                    className="h-full bg-[#5A5A40] rounded-full"
-                    initial={{ width: "0%" }}
-                    animate={{ width: `${bufferingProgress}%` }}
-                  />
-                </div>
-              </motion.div>
-            )}
-          </AnimatePresence>
         </div>
       </main>
     </div>
