@@ -21,7 +21,7 @@ interface AudioChunk {
   index: number;
   text: string;
   buffer: AudioBuffer | null;
-  status: 'pending' | 'fetching' | 'ready' | 'error';
+  status: 'pending' | 'fetching' | 'ready' | 'scheduled' | 'error';
   wordsCount: number;
 }
 
@@ -499,6 +499,9 @@ export default function App() {
 
         </div>
       </main>
+    </div>
+  );
+}
     </div>
   );
 }
