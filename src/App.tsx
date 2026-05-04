@@ -30,7 +30,13 @@ export default function App() {
   const [selectedVoice, setSelectedVoice] = useState<VoiceName>("Kore");
   const [isLoading, setIsLoading] = useState(false);
   const [history, setHistory] = useState<HistoryItem[]>([]);
-  const [isPlaying, setIsPlaying] = useState(false);
+  const [isPlaying, _setIsPlaying] = useState(false);
+  const isPlayingRef = useRef(false);
+  const setIsPlaying = (val: boolean) => {
+    isPlayingRef.current = val;
+    _setIsPlaying(val);
+  };
+
   const [isPaused, setIsPaused] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
   const [loadingStatus, setLoadingStatus] = useState<string | null>(null);
@@ -69,6 +75,9 @@ export default function App() {
       abortControllerRef.current.abort();
     }
     
+    setIsPlaying(false);
+    setIsPaused(false);
+    
     activeSourcesRef.current.forEach(source => {
       try { source.stop(); } catch {}
     });
@@ -78,8 +87,6 @@ export default function App() {
       cancelAnimationFrame(animationFrameRef.current);
     }
 
-    setIsPlaying(false);
-    setIsPaused(false);
     setIsLoading(false);
     setIsBuffering(false);
     setLoadingStatus(null);
@@ -94,35 +101,45 @@ export default function App() {
   };
 
   const decodeAudioBase64 = async (ctx: AudioContext, base64: string): Promise<AudioBuffer> => {
-    const binaryString = atob(base64);
-    const bytes = new Uint8Array(binaryString.length);
-    for (let i = 0; i < binaryString.length; i++) {
-      bytes[i] = binaryString.charCodeAt(i);
-    }
-    
-    const numSamples = bytes.length / 2;
-    const floatData = new Float32Array(numSamples);
-    const dataView = new DataView(bytes.buffer);
-
-    for (let i = 0; i < numSamples; i++) {
-      if (i * 2 + 1 < bytes.length) {
-        floatData[i] = dataView.getInt16(i * 2, true) / 32768;
+    try {
+      const binaryString = atob(base64);
+      const bytes = new Uint8Array(binaryString.length);
+      for (let i = 0; i < binaryString.length; i++) {
+        bytes[i] = binaryString.charCodeAt(i);
       }
-    }
+      
+      const numSamples = bytes.length / 2;
+      const floatData = new Float32Array(numSamples);
+      const dataView = new DataView(bytes.buffer);
 
-    const buffer = ctx.createBuffer(1, numSamples, 24000);
-    buffer.getChannelData(0).set(floatData);
-    return buffer;
+      for (let i = 0; i < numSamples; i++) {
+        if (i * 2 + 1 < bytes.length) {
+          floatData[i] = dataView.getInt16(i * 2, true) / 32768;
+        }
+      }
+
+      const buffer = ctx.createBuffer(1, numSamples, 24000);
+      buffer.getChannelData(0).set(floatData);
+      return buffer;
+    } catch (e) {
+      console.error("Decode error:", e);
+      throw e;
+    }
   };
 
   const fetchNextChunk = async () => {
     const queue = chunksQueueRef.current;
+    if (!isPlayingRef.current || !abortControllerRef.current) return;
+
     // Find next pending chunk
     const nextChunk = queue.find(c => c.status === 'pending');
-    if (!nextChunk || !abortControllerRef.current) return;
+    if (!nextChunk) return;
 
     nextChunk.status = 'fetching';
-    setLoadingStatus(`Przygotowuję fragment ${nextChunk.index + 1}/${queue.length}...`);
+    // Only show status if we are still buffering the very beginning
+    if (nextChunk.index < 3) {
+      setLoadingStatus(`Pobieram fragment ${nextChunk.index + 1}...`);
+    }
     
     try {
       const audioBase64 = await generateTTS(nextChunk.text, selectedVoice);
@@ -132,49 +149,48 @@ export default function App() {
         nextChunk.buffer = await decodeAudioBase64(audioContextRef.current, audioBase64);
         nextChunk.status = 'ready';
         
-        // IMMEDIATE ACTION: If this is the first chunk, or we are waiting for it, start playback NOW
-        if (nextChunk.index === 0 || (isPlaying && activeSourcesRef.current.size === 0)) {
-             setCurrentVisualData(audioBase64);
-             scheduleNextChunks();
+        // Save base64 for waveform if it's the first one
+        if (nextChunk.index === 0) {
+          setCurrentVisualData(audioBase64);
         }
+        
+        // Trigger scheduling immediately
+        scheduleNextChunks();
       } else {
         nextChunk.status = 'error';
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') {
         nextChunk.status = 'error';
-        toast.error(`Błąd pobierania frag. ${nextChunk.index + 1}`);
+        console.error("Fetch error:", e);
       }
     }
     
-    // Proactively fetch another chunk if there's no ongoing fetch
-    if (queue.some(c => c.status === 'pending') && !queue.some(c => c.status === 'fetching')) {
+    // Proactively fetch next
+    if (isPlayingRef.current) {
       fetchNextChunk();
     }
   };
 
   const scheduleNextChunks = () => {
-    if (!audioContextRef.current || !isPlaying) return;
     const ctx = audioContextRef.current;
+    if (!ctx || !isPlayingRef.current) return;
     
-    const PRELOAD_TIME = 2.0; // schedule chunks up to 2 seconds in advance
-    
-    // Find chunks that are ready but not scheduled yet
+    const PRELOAD_TIME = 3.0; 
     const queue = chunksQueueRef.current;
+
     for (let i = 0; i < queue.length; i++) {
       const chunk = queue[i];
       if (chunk.status === 'ready' && !activeSourcesRef.current.has(chunk.index)) {
         
-        // If it's the very first chunk being played
         if (nextStartTimeRef.current === 0) {
-          nextStartTimeRef.current = ctx.currentTime + 0.1;
+          nextStartTimeRef.current = ctx.currentTime + 0.2;
           playbackStartTimeRef.current = nextStartTimeRef.current;
           setIsBuffering(false);
           setIsLoading(false);
           setLoadingStatus(null);
         }
 
-        // Only schedule if within preload window
         if (nextStartTimeRef.current <= ctx.currentTime + PRELOAD_TIME) {
           const source = ctx.createBufferSource();
           source.buffer = chunk.buffer;
@@ -183,13 +199,10 @@ export default function App() {
           source.start(nextStartTimeRef.current);
           activeSourcesRef.current.set(chunk.index, source);
           
-          // Cleanup when chunk finishes
           source.onended = () => {
              activeSourcesRef.current.delete(chunk.index);
-             globalWordsPlayedRef.current += chunk.wordsCount;
-             
              if (chunk.index === queue.length - 1) {
-                 stopPlayback(); // All chunks finished
+                 stopPlayback();
              }
           };
 
@@ -197,19 +210,13 @@ export default function App() {
         }
       }
     }
-    
-    // Trigger next fetch if queue is running empty
-    if (queue.some(c => c.status === 'pending') && !queue.some(c => c.status === 'fetching')) {
-      fetchNextChunk();
-    }
   };
 
   const updateProgressLoop = () => {
-    if (!audioContextRef.current || !isPlaying) return;
+    if (!audioContextRef.current || !isPlayingRef.current) return;
     const ctx = audioContextRef.current;
     const queue = chunksQueueRef.current;
     
-    // Determine which chunk is currently playing based on time
     let timeAccumulator = playbackStartTimeRef.current;
     let playingIdx = -1;
     let timeIntoCurrentChunk = 0;
@@ -224,29 +231,27 @@ export default function App() {
           break;
         }
         timeAccumulator += chunk.buffer.duration;
-      } else {
-        break; // Reached uncharted territory
       }
     }
 
-    if (playingIdx !== -1 && playingIdx !== currentChunkIndexRef.current) {
-       currentChunkIndexRef.current = playingIdx;
-       setCurrentChunkDuration(queue[playingIdx].buffer!.duration);
-       // We can't trivially reconstruct base64 from audiobuffer here for waveform, 
-       // so the live waveform will represent the current context state, or we omit the base64 update to avoid lag.
-    }
-
     if (playingIdx !== -1) {
+       if (playingIdx !== currentChunkIndexRef.current) {
+         currentChunkIndexRef.current = playingIdx;
+         setCurrentChunkDuration(queue[playingIdx].buffer!.duration);
+       }
+       
        const chunkProgress = timeIntoCurrentChunk / queue[playingIdx].buffer!.duration;
        setPlaybackProgress(chunkProgress);
 
        if (isTrackingEnabled) {
           let wordsBefore = 0;
           for (let i = 0; i < playingIdx; i++) wordsBefore += queue[i].wordsCount;
-          
           const currentChunkWord = Math.floor(chunkProgress * queue[playingIdx].wordsCount);
           setCurrentWordIndex(wordsBefore + currentChunkWord);
        }
+       
+       // Periodically check if we need to schedule more
+       scheduleNextChunks();
     }
 
     animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
@@ -254,73 +259,55 @@ export default function App() {
 
   const handleSpeak = async () => {
     if (!text.trim()) {
-      toast.error("Wprowadź tekst do przeczytania");
+      toast.error("Wprowadź tekst");
       return;
     }
 
     stopPlayback();
     setIsLoading(true);
     setIsBuffering(true);
+    setIsPlaying(true); // Set both state and ref
     
     abortControllerRef.current = new AbortController();
 
-    if (audioContextRef.current) {
-      await audioContextRef.current.close();
-    }
-    audioContextRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+    try {
+      const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
+      audioContextRef.current = ctx;
+      await ctx.resume();
 
-    const words = text.trim().split(/\s+/).filter(w => w.length > 0);
-    const wordsPerSec = 160 / 60;
-    setTotalEstimatedDuration(words.length / wordsPerSec);
+      const words = text.trim().split(/\s+/).filter(w => w.length > 0);
+      setTotalEstimatedDuration(words.length / (160/60));
 
-    // Prepare Chunks
-    const chunks: AudioChunk[] = [];
-    const sentences = text.match(/[^.!?\n]+[.!?\n]+|.{1,500}/g) || [text];
-    let currentGroup = "";
-    const chunkLimit = 800; 
+      const chunks: AudioChunk[] = [];
+      const sentences = text.match(/[^.!?\n]+[.!?\n]+|.{1,400}/g) || [text];
+      let currentGroup = "";
 
-    for (const sentence of sentences) {
-      if ((currentGroup + sentence).length < chunkLimit) {
-        currentGroup += sentence;
-      } else {
-        if (currentGroup.trim()) {
-          chunks.push({
-             index: chunks.length,
-             text: currentGroup.trim(),
-             buffer: null,
-             status: 'pending',
-             wordsCount: currentGroup.trim().split(/\s+/).length
-          });
+      for (const sentence of sentences) {
+        if ((currentGroup + sentence).length < 600) {
+          currentGroup += sentence;
+        } else {
+          if (currentGroup.trim()) {
+            chunks.push({ index: chunks.length, text: currentGroup.trim(), buffer: null, status: 'pending', wordsCount: currentGroup.trim().split(/\s+/).length });
+          }
+          currentGroup = sentence;
         }
-        currentGroup = sentence;
       }
-    }
-    if (currentGroup.trim()) {
-      chunks.push({
-         index: chunks.length,
-         text: currentGroup.trim(),
-         buffer: null,
-         status: 'pending',
-         wordsCount: currentGroup.trim().split(/\s+/).length
-      });
-    }
+      if (currentGroup.trim()) {
+        chunks.push({ index: chunks.length, text: currentGroup.trim(), buffer: null, status: 'pending', wordsCount: currentGroup.trim().split(/\s+/).length });
+      }
 
-    chunksQueueRef.current = chunks;
-    
-    // Add to history
-    const newItem: HistoryItem = {
-      id: crypto.randomUUID(),
-      text,
-      timestamp: Date.now(),
-      voice: selectedVoice,
-    };
-    setHistory(prev => [newItem, ...prev].slice(0, 10));
-
-    setIsPlaying(true);
-    
-    // Start playback loop logic
-    fetchNextChunk();
-    animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
+      chunksQueueRef.current = chunks;
+      
+      // Start loops
+      fetchNextChunk();
+      // Start second parallel fetcher for speed
+      setTimeout(() => fetchNextChunk(), 500);
+      
+      animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
+    } catch (e) {
+      console.error("Context error:", e);
+      stopPlayback();
+    }
   };
 
   const handlePlayPause = async () => {
