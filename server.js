@@ -51,7 +51,6 @@ app.post('/api/tts', async (req, res) => {
       model: 'gemini-3.1-flash-tts-preview',
       contents: [{ parts: [{ text }] }],
       config: {
-        systemInstruction: "Jesteś profesjonalnym polskim lektorem. Twoim jedynym zadaniem jest przeczytanie podanego tekstu DOKŁADNIE tak, jak jest napisany. Nie streszczaj, nie komentuj, nie zmieniaj treści. Czytaj słowo w słowo od początku do końca.",
         responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: {
