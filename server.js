@@ -14,6 +14,28 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Basic Auth - tylko jeśli ustawiono hasło
+const AUTH_PASSWORD = process.env.AUTH_PASSWORD;
+if (AUTH_PASSWORD) {
+  app.use((req, res, next) => {
+    const auth = req.headers.authorization;
+    if (!auth || !auth.startsWith('Basic ')) {
+      res.setHeader('WWW-Authenticate', 'Basic realm="TTS Reader"');
+      return res.status(401).send('Wymagane logowanie');
+    }
+
+    const credentials = Buffer.from(auth.split(' ')[1], 'base64').toString();
+    const [user, pass] = credentials.split(':');
+
+    if (pass === AUTH_PASSWORD) {
+      next();
+    } else {
+      res.setHeader('WWW-Authenticate', 'Basic realm="TTS Reader"');
+      return res.status(401).send('Nieprawidłowe hasło');
+    }
+  });
+}
+
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // API endpoint
