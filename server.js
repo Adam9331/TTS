@@ -47,12 +47,11 @@ app.post('/api/tts', async (req, res) => {
       return res.status(400).json({ error: 'Text is required' });
     }
 
-    const response = await ai.getGenerativeModel({ 
+    const response = await ai.models.generateContent({
       model: 'gemini-3.1-flash-tts-preview',
-      systemInstruction: "Jesteś profesjonalnym polskim lektorem. Twoim jedynym zadaniem jest przeczytanie podanego tekstu DOKŁADNIE tak, jak jest napisany. Nie streszczaj, nie komentuj, nie zmieniaj treści. Czytaj słowo w słowo od początku do końca.",
-    }).generateContent({
       contents: [{ parts: [{ text }] }],
       config: {
+        systemInstruction: "Jesteś profesjonalnym polskim lektorem. Twoim jedynym zadaniem jest przeczytanie podanego tekstu DOKŁADNIE tak, jak jest napisany. Nie streszczaj, nie komentuj, nie zmieniaj treści. Czytaj słowo w słowo od początku do końca.",
         responseModalities: ['AUDIO'],
         speechConfig: {
           voiceConfig: {
