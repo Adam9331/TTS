@@ -194,28 +194,30 @@ export default function App() {
       const words = textToSpeak.trim().split(/\s+/).filter(w => w.length > 0);
       totalWordsRef.current = words.length;
 
-      // Split text into chunks
+      // Split text into chunks - smaller chunks for better reliability
       const chunks: string[] = [];
-      const sentences = textToSpeak.match(/[^.!?]+[.!?]+|.{1,1000}/g) || [textToSpeak];
+      // Split by sentences, but keep them together up to a limit
+      const sentences = textToSpeak.match(/[^.!?\n]+[.!?\n]+|.{1,500}/g) || [textToSpeak];
 
       let currentGroup = "";
-      let isFirstChunk = true;
-      const firstChunkLimit = 600;
-      const normalChunkLimit = 3000;
+      const chunkLimit = 800; // Safer limit for Gemini TTS
 
       for (const sentence of sentences) {
-        const limit = isFirstChunk ? firstChunkLimit : normalChunkLimit;
-        if ((currentGroup + sentence).length < limit) {
+        if ((currentGroup + sentence).length < chunkLimit) {
           currentGroup += sentence;
         } else {
           if (currentGroup) {
             chunks.push(currentGroup.trim());
-            isFirstChunk = false;
           }
           currentGroup = sentence;
+          // If a single sentence is still too long, split it further
+          while (currentGroup.length > chunkLimit) {
+            chunks.push(currentGroup.substring(0, chunkLimit).trim());
+            currentGroup = currentGroup.substring(chunkLimit);
+          }
         }
       }
-      if (currentGroup) chunks.push(currentGroup.trim());
+      if (currentGroup.trim()) chunks.push(currentGroup.trim());
 
       // Add to history
       if (textToSpeak === text) {
@@ -232,26 +234,16 @@ export default function App() {
       const audioDataParts: string[] = [];
       setTotalChunks(chunks.length);
       setLoadingStatus(`Pobieram audio (0/${chunks.length})...`);
-      console.log(`Starting to fetch ${chunks.length} chunks...`);
 
       for (let i = 0; i < chunks.length; i++) {
-        if (signal.aborted) {
-          console.log('Aborted at chunk', i);
-          break;
-        }
+        if (signal.aborted) break;
 
         const chunk = chunks[i];
         setLoadingStatus(`Przetwarzam część ${i + 1} z ${chunks.length}...`);
-        console.log(`Fetching chunk ${i + 1}/${chunks.length}:`, chunk.substring(0, 50) + '...');
 
         try {
           const audio = await generateTTS(chunk, selectedVoice);
-          console.log(`Chunk ${i + 1} received:`, audio ? `${audio.length} chars` : 'null');
-
-          if (signal.aborted) {
-            console.log('Aborted after fetch at chunk', i);
-            break;
-          }
+          if (signal.aborted) break;
 
           if (audio) {
             audioDataParts.push(audio);
@@ -260,51 +252,56 @@ export default function App() {
           }
         } catch (err) {
           console.error(`Error fetching chunk ${i + 1}:`, err);
-          setLoadingStatus(`Błąd przy części ${i + 1}...`);
         }
+      }
+
+      if (signal.aborted || audioDataParts.length === 0) {
+        setIsLoading(false);
+        setIsBuffering(false);
+        return;
       }
 
       setLoadingStatus("Łączę audio...");
-      console.log(`Fetched ${audioDataParts.length}/${chunks.length} chunks`);
-
-      if (signal.aborted) {
-        console.log('Aborted before combining');
-        return;
-      }
-
-      if (audioDataParts.length === 0) {
-        toast.error("Nie udało się wygenerować audio");
-        return;
-      }
-
-      setIsBuffering(false);
-      setIsLoading(false);
-
-      // Combine all audio data
-      const allBytes: number[] = [];
-      for (const part of audioDataParts) {
+      
+      // Efficiently combine audio data
+      const byteArrays = audioDataParts.map(part => {
         const binaryString = atob(part);
+        const bytes = new Uint8Array(binaryString.length);
         for (let i = 0; i < binaryString.length; i++) {
-          allBytes.push(binaryString.charCodeAt(i));
+          bytes[i] = binaryString.charCodeAt(i);
         }
+        return bytes;
+      });
+
+      const totalLength = byteArrays.reduce((acc, curr) => acc + curr.length, 0);
+      const combinedBytes = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const byteArray of byteArrays) {
+        combinedBytes.set(byteArray, offset);
+        offset += byteArray.length;
       }
 
-      const combinedBytes = new Uint8Array(allBytes);
-      let binaryStr = '';
-      for (let i = 0; i < combinedBytes.length; i++) {
-        binaryStr += String.fromCharCode(combinedBytes[i]);
-      }
-      const combinedBase64 = btoa(binaryStr);
-      setCombinedAudioData(combinedBase64);
+      // Set combined audio for waveform visualization
+      // Using a more efficient way to create base64 for large data
+      const blob = new Blob([combinedBytes], { type: 'audio/pcm' });
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const base64data = reader.result as string;
+        setCombinedAudioData(base64data.split(',')[1]);
+      };
+      reader.readAsDataURL(blob);
 
-      // Create AudioBuffer
+      // Create AudioBuffer from raw PCM 16-bit
       const numSamples = combinedBytes.length / 2;
       const floatData = new Float32Array(numSamples);
       const dataView = new DataView(combinedBytes.buffer);
 
       for (let i = 0; i < numSamples; i++) {
-        const sample = dataView.getInt16(i * 2, true);
-        floatData[i] = sample / 32768;
+        // Ensure we don't go out of bounds
+        if (i * 2 + 1 < combinedBytes.length) {
+          const sample = dataView.getInt16(i * 2, true);
+          floatData[i] = sample / 32768;
+        }
       }
 
       const buffer = audioContextRef.current.createBuffer(1, numSamples, 24000);
