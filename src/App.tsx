@@ -21,6 +21,7 @@ interface AudioChunk {
   index: number;
   text: string;
   buffer: AudioBuffer | null;
+  audioBase64?: string;
   status: 'pending' | 'fetching' | 'ready' | 'scheduled' | 'error';
   wordsCount: number;
 }
@@ -52,7 +53,8 @@ export default function App() {
   const abortControllerRef = useRef<AbortController | null>(null);
   const currentChunkIndexRef = useRef(-1);
   const nextStartTimeRef = useRef(0);
-  const globalWordsPlayedRef = useRef(0);
+  const scheduledIndexRef = useRef(-1);
+  const chunkStartTimesRef = useRef<Map<number, number>>(new Map());
   const animationFrameRef = useRef<number>(0);
   const playbackStartTimeRef = useRef(0);
   
@@ -96,8 +98,9 @@ export default function App() {
     
     chunksQueueRef.current = [];
     currentChunkIndexRef.current = -1;
+    scheduledIndexRef.current = -1;
+    chunkStartTimesRef.current.clear();
     nextStartTimeRef.current = 0;
-    globalWordsPlayedRef.current = 0;
   };
 
   const decodeAudioBase64 = async (ctx: AudioContext, base64: string): Promise<AudioBuffer> => {
@@ -147,17 +150,14 @@ export default function App() {
       
       if (audioBase64 && audioContextRef.current) {
         nextChunk.buffer = await decodeAudioBase64(audioContextRef.current, audioBase64);
+        nextChunk.audioBase64 = audioBase64;
         nextChunk.status = 'ready';
-        
-        // Save base64 for waveform if it's the first one
-        if (nextChunk.index === 0) {
-          setCurrentVisualData(audioBase64);
-        }
         
         // Trigger scheduling immediately
         scheduleNextChunks();
       } else {
         nextChunk.status = 'error';
+        // If it's an error, we still need to progress or skip it in scheduler
       }
     } catch (e: any) {
       if (e.name !== 'AbortError') {
@@ -176,39 +176,60 @@ export default function App() {
     const ctx = audioContextRef.current;
     if (!ctx || !isPlayingRef.current) return;
     
-    const PRELOAD_TIME = 3.0; 
+    const PRELOAD_TIME = 4.0; 
     const queue = chunksQueueRef.current;
 
-    for (let i = 0; i < queue.length; i++) {
-      const chunk = queue[i];
-      if (chunk.status === 'ready') {
+    while (scheduledIndexRef.current + 1 < queue.length) {
+      const nextIdx = scheduledIndexRef.current + 1;
+      const chunk = queue[nextIdx];
+      
+      if (chunk.status === 'error') {
+        scheduledIndexRef.current = nextIdx;
+        continue;
+      }
+      
+      if (chunk.status !== 'ready') break;
+
+      if (nextStartTimeRef.current === 0) {
+        nextStartTimeRef.current = ctx.currentTime + 0.2;
+        playbackStartTimeRef.current = nextStartTimeRef.current;
+        setIsBuffering(false);
+        setIsLoading(false);
+        setLoadingStatus(null);
+      }
+
+      if (nextStartTimeRef.current <= ctx.currentTime + PRELOAD_TIME) {
+        chunk.status = 'scheduled';
+        scheduledIndexRef.current = nextIdx;
         
-        if (nextStartTimeRef.current === 0) {
-          nextStartTimeRef.current = ctx.currentTime + 0.2;
-          playbackStartTimeRef.current = nextStartTimeRef.current;
-          setIsBuffering(false);
-          setIsLoading(false);
-          setLoadingStatus(null);
-        }
+        const source = ctx.createBufferSource();
+        source.buffer = chunk.buffer;
+        source.connect(ctx.destination);
+        
+        source.start(nextStartTimeRef.current);
+        chunkStartTimesRef.current.set(chunk.index, nextStartTimeRef.current);
+        activeSourcesRef.current.set(chunk.index, source);
+        
+        const duration = chunk.buffer.duration;
+        source.onended = () => {
+           activeSourcesRef.current.delete(chunk.index);
+           // If this was the last chunk in the queue, or all subsequent chunks are errors
+           const isLast = chunk.index === queue.length - 1;
+           const noMorePlayable = queue.slice(chunk.index + 1).every(c => c.status === 'error');
+           
+           if (isLast || (noMorePlayable && queue.length > chunk.index + 1)) {
+               // Small delay to ensure any remaining audio finishes
+               setTimeout(() => {
+                 if (isPlayingRef.current && activeSourcesRef.current.size === 0) {
+                   stopPlayback();
+                 }
+               }, 100);
+           }
+        };
 
-        if (nextStartTimeRef.current <= ctx.currentTime + PRELOAD_TIME) {
-          chunk.status = 'scheduled'; // FIXED: Prevent loop
-          const source = ctx.createBufferSource();
-          source.buffer = chunk.buffer;
-          source.connect(ctx.destination);
-          
-          source.start(nextStartTimeRef.current);
-          activeSourcesRef.current.set(chunk.index, source);
-          
-          source.onended = () => {
-             activeSourcesRef.current.delete(chunk.index);
-             if (chunk.index === queue.length - 1) {
-                 stopPlayback();
-             }
-          };
-
-          nextStartTimeRef.current += chunk.buffer!.duration;
-        }
+        nextStartTimeRef.current += duration;
+      } else {
+        break;
       }
     }
   };
@@ -217,21 +238,23 @@ export default function App() {
     if (!audioContextRef.current || !isPlayingRef.current) return;
     const ctx = audioContextRef.current;
     const queue = chunksQueueRef.current;
+    const startTimes = chunkStartTimesRef.current;
     
-    let timeAccumulator = playbackStartTimeRef.current;
     let playingIdx = -1;
     let timeIntoCurrentChunk = 0;
     
-    for (let i = 0; i < queue.length; i++) {
+    for (let i = 0; i <= scheduledIndexRef.current; i++) {
+      const startTime = startTimes.get(i);
       const chunk = queue[i];
-      if (chunk.buffer) {
-        const chunkEnd = timeAccumulator + chunk.buffer.duration;
-        if (ctx.currentTime >= timeAccumulator && ctx.currentTime < chunkEnd) {
+      if (startTime !== undefined && chunk.buffer) {
+        const duration = chunk.buffer.duration;
+        const endTime = startTime + duration;
+        
+        if (ctx.currentTime >= startTime && ctx.currentTime < endTime) {
           playingIdx = i;
-          timeIntoCurrentChunk = ctx.currentTime - timeAccumulator;
+          timeIntoCurrentChunk = ctx.currentTime - startTime;
           break;
         }
-        timeAccumulator += chunk.buffer.duration;
       }
     }
 
@@ -239,6 +262,9 @@ export default function App() {
        if (playingIdx !== currentChunkIndexRef.current) {
          currentChunkIndexRef.current = playingIdx;
          setCurrentChunkDuration(queue[playingIdx].buffer!.duration);
+         if (queue[playingIdx].audioBase64) {
+           setCurrentVisualData(queue[playingIdx].audioBase64);
+         }
        }
        
        const chunkProgress = timeIntoCurrentChunk / queue[playingIdx].buffer!.duration;
@@ -250,10 +276,10 @@ export default function App() {
           const currentChunkWord = Math.floor(chunkProgress * queue[playingIdx].wordsCount);
           setCurrentWordIndex(wordsBefore + currentChunkWord);
        }
-       
-       // Periodically check if we need to schedule more
-       scheduleNextChunks();
     }
+    
+    // Always check if more chunks can be scheduled
+    scheduleNextChunks();
 
     animationFrameRef.current = requestAnimationFrame(updateProgressLoop);
   };
